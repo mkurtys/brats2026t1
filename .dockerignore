@@ -1,0 +1,19 @@
+# Git history — large, not needed in image
+.git
+nnUNet/.git
+
+# nnUNet build artifacts
+nnUNet/*.egg-info
+
+# Data and results — mounted at runtime
+nnunet_raw/
+nnunet_preprocessed/
+nnunet_results/
+predictions/
+results/
+
+# Dev artifacts
+__pycache__/
+*.pyc
+.vscode/
+logs/

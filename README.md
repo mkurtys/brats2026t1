@@ -96,6 +96,27 @@ source scripts/setup_env.sh
 
 Sets `nnUNet_raw`, `nnUNet_preprocessed`, `nnUNet_results`, and `nnUNet_extTrainer` (points nnUNet's trainer discovery at `mbrats/training/`). Run once per shell session.
 
+## Docker
+
+Useful for reproducible environments and offline machines.
+
+```bash
+# Build (once, requires internet)
+docker build -t brats2026 .
+
+# Run any command with data dirs mounted from the current working directory
+bash docker/run.sh nnUNetv2_train 1 3d_fullres 0 -tr nnUNetTrainerBraTS --npz
+
+# Interactive shell
+bash docker/run.sh bash
+```
+
+Data directories (`nnunet_raw/`, `nnunet_preprocessed/`, `nnunet_results/`, `predictions/`) are mounted from the host working directory. Override the data source or image name via env vars:
+
+```bash
+BRATS_DATA_DIR=/path/to/data BRATS_IMAGE=brats2026 bash docker/run.sh <cmd>
+```
+
 ## Quickstart
 
 ```bash

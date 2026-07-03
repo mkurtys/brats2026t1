@@ -43,15 +43,7 @@ if step 1 "convert"; then
         --add_ratio
 fi
 
-# ── Step 2: preprocess — default plans ────────────────────────────────────────
-if step 2 "preprocess (nnUNetPlans, 6-channel)"; then
-    nnUNetv2_plan_and_preprocess \
-        -d $DATASET_ID \
-        --verify_dataset_integrity \
-        -np 8
-fi
-
-# ── Step 3: preprocess — ResEncUNetL plans ────────────────────────────────────
+# ── Step 2: preprocess — ResEncUNetL plans ────────────────────────────────────
 if step 3 "preprocess (nnUNetResEncUNetLPlans, 6-channel)"; then
     nnUNetv2_plan_and_preprocess \
         -d $DATASET_ID \
