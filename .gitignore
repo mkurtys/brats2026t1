@@ -1,3 +1,6 @@
+results/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -216,3 +219,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# IDE
+.vscode/
+
+# Project: large data and model directories
+nnunet_preprocessed/
+nnunet_raw/
+nnunet_results/
+predictions/
+
+# nnUNet/ is a git clone tracked in this repo and installed as editable (pip install -e nnUNet/)
+# Custom trainers live in mbrats/training/, discovered via nnUNet_extTrainer env var.
