@@ -1,5 +1,20 @@
 # Ideas
 
+## Training Strategy
+
+**Baseline: ResEncUNetM, standard Dice+CE loss, 1000 epochs.**
+ResEncUNetM was chosen over ResEncUNetL because the auto-planned patch for L (`128×224×256`) was nearly full-volume and impractically slow (~325s/epoch on RTX 3090). M auto-plans to `96×160×160` (~105s/epoch), which is 3× faster while still covering ~55% of the brain per patch.
+
+From this baseline we will branch into loss experiments (keeping architecture fixed):
+1. Per-class loss weighting (inverse voxel frequency)
+2. Focal loss (replace CE)
+3. Auxiliary TC + WT region losses
+4. Combinations of the above
+
+Fine-tuning from the baseline checkpoint avoids retraining from scratch for each experiment.
+
+---
+
 ## Registration
 
 Register all cases to a common space** — the mix of native-space (1268) and SRI24-space (328) cases may be hurting consistency. Registering everything to SRI24 could improve generalization.
@@ -26,6 +41,30 @@ nnUNet resamples all cases to the median spacing `[1.0, 0.899, 0.859]`mm. At 1mm
 3. **Ensemble + TTA first (free)** — more prediction votes per voxel smooths probability maps near tiny lesions. Try this before any architectural change.
 
 **Verdict:** Ensemble + TTA is the free win. High-res training helps mainly sub-mm cases (a subset of the dataset). Biggest ROI if small-lesion F1 is still poor after ensembling.
+
+**Update (2026-07-10) — precise per-axis breakdown vs the actual planned target `[1.0, 0.8984, 0.8594]`mm:**
+Defining "significantly more detailed" as native spacing >20% finer than the planned target on that axis:
+
+| Axis | Cases >20% finer than target |
+|---|---|
+| x | 323/1296 (24.9%) |
+| y | 486/1296 (37.5%) |
+| z | 477/1296 (36.8%) |
+
+- **Any axis >20% finer: 633/1296 (48.8%)** — nearly half the dataset has real native detail discarded by resampling, not just an isolated slice-thickness effect.
+- **All three axes >20% finer: 169/1296 (13.0%)** — a meaningful minority are genuinely high-res on every axis, not just thin-slice artifacts.
+- Per-case axis count: 51.2% have 0 finer axes (nothing lost), 11.5% have 1, 24.3% have 2, 13.0% have 3.
+
+This is a bigger fraction of the dataset than the earlier "sub-mm is a small subset" framing suggested — worth re-weighing option 1/2 against ensemble+TTA once ensemble results are in, rather than assuming high-res only matters for a minority of cases.
+
+![Per-axis native spacing distribution vs planned target](eda/spacing_per_axis_hist.png)
+![Per-case count of axes >20% finer than planned target](eda/spacing_finer_axis_counts.png)
+
+Full analysis notebook: `eda/spacing_analysis.ipynb`.
+
+The per-axis histogram shows *why* it's the y/z axes carrying the effect: x is tightly clustered right at the 1.0mm target, but y and z each have a large cluster sitting at ~0.5mm, well below their ~0.9/0.86mm targets. That points to a cheaper option than full 0.5mm isotropic:
+
+4. **Anisotropic high-res model at `[1, 0.5, 0.5]`mm** — keep x at its current target (already matches most cases, nothing to gain there) and only sharpen y/z to 0.5mm, where the real discarded detail actually lives. ~4× more voxels per lesion instead of 8×, meaningfully cheaper on patch size/VRAM than option 1 while still targeting the axes that matter. Worth checking whether the x/y/z axis order used here needs to be re-derived per case if left/right or slice-direction labeling isn't consistent across sites — the fingerprint stats are per-axis in file order, not necessarily anatomically consistent across all 1296 cases.
 
 ---
 

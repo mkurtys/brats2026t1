@@ -223,6 +223,8 @@ __marimo__/
 # IDE
 .vscode/
 
+tmp/
+
 # Project: large data and model directories
 nnunet_preprocessed/
 nnunet_raw/

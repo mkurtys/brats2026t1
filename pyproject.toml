@@ -30,6 +30,13 @@ dependencies = [
     "blosc2>=3.3.2"
 ]
 
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "nbconvert",
+    "ipykernel",
+]
+
 [build-system]
 requires = ["setuptools>=67.8.0"]
 build-backend = "setuptools.build_meta"

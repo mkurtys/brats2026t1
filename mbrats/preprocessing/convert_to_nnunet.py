@@ -29,9 +29,13 @@ MODALITY_MAP = {
     "t2f": "_0003",
 }
 
+LABEL_REMAPS: dict[str, dict[int, int]] = {
+    "BraTS-MET-01094-002": {6: 0},  # label 6 not in spec (129 voxels), remap to background
+}
+
 DATASET_JSON = {
     "channel_names": {"0": "T1", "1": "T1CE", "2": "T2", "3": "FLAIR"},
-    "labels": {"background": 0, "NETC": 1, "ET": 2, "SNFH": 3, "RC": 4},
+    "labels": {"background": 0, "NETC": 1, "SNFH": 2, "ET": 3, "RC": 4},
     "regions_class_order": [1, 2, 3, 4],
     "file_ending": ".nii.gz",
     "dataset_name": "BraTSMETS",
@@ -136,6 +140,8 @@ def convert(
         missing_mods = [m for m in MODALITY_MAP if m not in files]
         if missing_mods:
             print(f"  SKIP {case_id}: missing {missing_mods}")
+            missing = DATASET_JSON.get("missing_modalities", [])
+            missing.append(case_id)
             skipped += 1
             continue
 
@@ -165,12 +171,21 @@ def convert(
         seg_src = overrides.get(case_id, files.get("seg"))
         if seg_src is None:
             print(f"  SKIP {case_id}: no segmentation")
+
             skipped += 1
             continue
         seg_dst = labels_tr / f"{case_id}.nii.gz"
         if seg_dst.exists() or seg_dst.is_symlink():
             seg_dst.unlink()
-        if use_symlinks:
+        remaps = LABEL_REMAPS.get(case_id, {})
+        if remaps:
+            img = nib.load(str(seg_src))
+            data = img.get_fdata(dtype=np.float32).astype(np.int16)
+            for old, new in remaps.items():
+                data[data == old] = new
+            print(f"  Remapped labels {remaps} for {case_id}")
+            nib.save(nib.Nifti1Image(data, img.affine, img.header), str(seg_dst))
+        elif use_symlinks:
             os.symlink(seg_src.resolve(), seg_dst)
         else:
             shutil.copy2(seg_src, seg_dst)

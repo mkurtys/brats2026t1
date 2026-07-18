@@ -10,6 +10,7 @@ Changes vs default nnUNetTrainer:
      proportionally higher selection probability.
 """
 
+from os.path import join
 from typing import Union, Tuple, List
 
 import numpy as np
@@ -331,6 +332,15 @@ class nnUNetTrainerBraTS(nnUNetTrainer):
         return mt_gen_train, mt_gen_val
 
 
+class nnUNetTrainerCheckpoint250(nnUNetTrainer):
+    """Standard nnUNetTrainer with checkpoints saved every 250 epochs."""
+    def on_epoch_end(self):
+        current_epoch = self.current_epoch
+        super().on_epoch_end()
+        if (current_epoch + 1) % 250 == 0 and (current_epoch + 1) != self.num_epochs:
+            self.save_checkpoint(join(self.output_folder, f'checkpoint_{current_epoch + 1:04d}.pth'))
+
+
 class nnUNetTrainerBraTS_2epochs(nnUNetTrainerBraTS):
     def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
@@ -341,3 +351,34 @@ class nnUNetTrainerBraTS_250epochs(nnUNetTrainerBraTS):
     def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 250
+
+
+class nnUNetTrainerBraTS_500epochs(nnUNetTrainerBraTS):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 500
+
+
+class nnUNetTrainerBraTS_1000epochs(nnUNetTrainerBraTS):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 1000
+
+
+class nnUNetTrainerBraTS_750epochs(nnUNetTrainerBraTS):
+    """
+    For resuming nnUNetTrainerBraTS_500epochs to 750 epochs total.
+
+    PolyLRScheduler.step(current_epoch) recomputes LR from self.initial_lr and
+    self.num_epochs every epoch (see on_train_epoch_start), overwriting whatever
+    LR was restored from the checkpoint's optimizer state. Resuming at epoch 500
+    with the default initial_lr=1e-2 and num_epochs=750 would jump the LR back
+    up to ~5e-3 (progress 500/750=0.67 on a fresh 1e-2 schedule) even though it
+    had already decayed to ~0 by the end of the 500-epoch run. Lowering
+    initial_lr an order of magnitude keeps the post-resume LR small
+    (~4e-4 at epoch 500) instead of re-inflating it.
+    """
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 750
+        self.initial_lr = 1e-3

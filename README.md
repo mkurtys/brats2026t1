@@ -25,6 +25,17 @@ Three files:
 * corrected labels - corrected labels for BraTS-MET-01094-003-seg.nii.gz  BraTS-MET-01184-002-seg.nii.gz
 * validation - data
 
+### Known data quirks
+
+* `BraTS-MET-01094-002` — GT label 6 (129 voxels, out of the 0-4 spec) remapped to background
+  in `convert_to_nnunet.py` (`LABEL_REMAPS`). Its only remaining annotation is a single ~19.8k
+  voxel ET region tracing the cortical/dural surface across ~70 axial slices rather than a
+  focal nodular lesion — visually consistent with diffuse dural/leptomeningeal enhancement
+  (a real, if atypical, presentation of metastatic disease; see radiology literature on
+  leptomeningeal carcinomatosis). Kept as-is rather than excluded or zeroed: the fold-0
+  checkpoint_0500 model, despite being trained on this exact case, predicts background for
+  99.9% of these voxels, so it isn't teaching the network to call dura "ET" in practice.
+
 
 ## Data Pre-Preprocessing
 
@@ -34,7 +45,9 @@ Adding T1c−T1n subtraction + T1c/T1n ratio =  6-channel per case (T1n, T1c, T2
 
 ## NNUnet Plan and preprocess
 
-Observation is that regardless of planner used, dataset is processed same way (normalization/cropping/resampling), so we can reuse preprocessed dataset
+Observation is that regardless of planner used, dataset is processed same way (normalization/cropping/resampling), so we can reuse preprocessed dataset.
+
+Confirmed by inspecting the plan JSONs: `nnUNetResEncUNetLPlans.json` and `nnUNetResEncUNetMPlans.json` have the same `spacing`, `normalization_schemes`, `resampling_fn_data/seg`, and `use_mask_for_norm` as `nnUNetPlans.json` (only `patch_size`/`batch_size` differ, which are consumed at train time). Each plan's `configurations.3d_fullres.data_identifier` is already set to `nnUNetPlans_3d_fullres`, so nnU-Net reads from the same preprocessed data folder automatically — **no symlink or separate preprocessing needed**, just pass `-p <plans_name>` (e.g. `-p nnUNetResEncUNetLPlans`) to `nnUNetv2_train`/`nnUNetv2_predict`.
 
 Plan
 ```bash 

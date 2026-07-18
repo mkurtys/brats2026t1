@@ -11,6 +11,7 @@ Note: nnUNet's default class-uniform sampling (picking a class uniformly before
 picking a voxel) is already implemented in the base DataLoader and is preserved here.
 """
 
+import functools
 import warnings
 from typing import Union, Tuple, List
 
@@ -27,6 +28,8 @@ from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import MemoryEfficientSoftDiceLoss
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
+
+from mbrats.training.lr_schedules import WarmupPolyLRScheduler
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -83,42 +86,122 @@ class DC_and_Focal_loss(DC_and_CE_loss):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def tversky(p, g, alpha=0.3, beta=0.7, gamma=1.33, eps=1e-6):
-    # p, g: (B, ...) probabilities and binary GT for ONE region
-    tp = (p * g).sum(dim=tuple(range(1, p.ndim)))
-    fp = (p * (1 - g)).sum(dim=tuple(range(1, p.ndim)))
-    fn = ((1 - p) * g).sum(dim=tuple(range(1, p.ndim)))
-    ti = (tp + eps) / (tp + alpha * fp + beta * fn + eps)
-    return ((1 - ti) ** gamma).mean()
+    # p, g: (B, *spatial) probabilities and binary GT for ONE region
+    tp = (p * g).sum(dim=tuple(range(1, p.ndim)))                 # (B,)
+    fp = (p * (1 - g)).sum(dim=tuple(range(1, p.ndim)))           # (B,)
+    fn = ((1 - p) * g).sum(dim=tuple(range(1, p.ndim)))           # (B,)
+    # ti: Tversky index, a generalized Dice (Dice = this formula with alpha=beta=0.5).
+    # alpha=0.3, beta=0.7 weights FN (missed lesion voxels) > 2x harder than FP in the
+    # denominator, so a high ti requires recall more than it requires precision.
+    ti = (tp + eps) / (tp + alpha * fp + beta * fn + eps)         # (B,)
+    # loss = (1-ti)^gamma is linear in ti at gamma=1 (dL/dti = -1, constant slope regardless
+    # of how good ti already is). gamma=1.33 curves it: dL/dti = -gamma*(1-ti)^(gamma-1),
+    # which -> 0 as ti->1 (vanishing gradient on already-good instances) and stays near its
+    # max as ti->0 (full gradient on still-bad instances) — a focal-style hardness focus,
+    # per instance rather than per voxel. 1.33 = 4/3, the default gamma from the Focal
+    # Tversky Loss paper (Abraham & Khan 2019).
+    return ((1 - ti) ** gamma).mean()                             # scalar
 
 
 _BLOB_CHUNK = 8   # components per chunk — bounds memory to ~8 × patch × 4 intermediate tensors
 _BLOB_MAX   = 64  # skip cases with more CCs (elastic deformation fragments → noise anyway)
 
 def blob_term(p, comp_labels, n_comp, alpha=0.3, beta=0.7):
+    # p, comp_labels: (*spatial) — single batch element (called per-b in _tc_rc_blob_loss)
     if n_comp == 0 or n_comp > _BLOB_MAX:
-        return p.new_tensor(0.0)
-    all_fg = (comp_labels > 0).float()
-    cl_exp = comp_labels.unsqueeze(0)
-    ndim   = p.ndim
-    total  = p.new_tensor(0.0)
+        return p.new_tensor(0.0)                    # scalar
+    all_fg = (comp_labels > 0).float()               # (*spatial)
+    cl_exp = comp_labels.unsqueeze(0)                # (1, *spatial)
+    ndim   = p.ndim                                  # spatial rank, e.g. 3
+    total  = p.new_tensor(0.0)                        # scalar accumulator
     for start in range(1, n_comp + 1, _BLOB_CHUNK):
-        ids     = torch.arange(start, min(start + _BLOB_CHUNK, n_comp + 1), device=p.device)
+        ids     = torch.arange(start, min(start + _BLOB_CHUNK, n_comp + 1), device=p.device)  # (chunk,)
         chunk   = len(ids)
-        ids_    = ids.view(chunk, *([1] * ndim))
+        ids_    = ids.view(chunk, *([1] * ndim))     # (chunk, 1, 1, 1)
+        # gi: stack of one-hot GT masks, one per instance in this chunk. gi[k] == 1 at every
+        # voxel belonging to instance ids[k], 0 elsewhere (including other instances' voxels).
         gi      = (cl_exp == ids_).float()          # (chunk, *spatial)
-        pi      = p.unsqueeze(0) * (1 - (all_fg - gi).clamp(0, 1))
-        tp      = (pi * gi).sum(dim=tuple(range(1, ndim + 1)))
-        fp      = (pi * (1 - gi)).sum(dim=tuple(range(1, ndim + 1)))
-        fn      = ((1 - pi) * gi).sum(dim=tuple(range(1, ndim + 1)))
-        ti      = (tp + 1e-6) / (tp + alpha * fp + beta * fn + 1e-6)
-        total   = total + ((1 - ti) ** 1.33).sum()
-    return total / n_comp
+        # pi: predicted prob map p, broadcast per instance, with prediction mass on OTHER
+        # instances' voxels zeroed out ((all_fg - gi) is 1 only on other instances' territory).
+        # This stops a prediction spilling onto a neighboring lesion from counting as this
+        # instance's false positive — each instance is scored only against its own voxels
+        # plus true background.
+        pi      = p.unsqueeze(0) * (1 - (all_fg - gi).clamp(0, 1))  # (chunk, *spatial)
+        tp      = (pi * gi).sum(dim=tuple(range(1, ndim + 1)))       # (chunk,)
+        fp      = (pi * (1 - gi)).sum(dim=tuple(range(1, ndim + 1)))  # (chunk,)
+        fn      = ((1 - pi) * gi).sum(dim=tuple(range(1, ndim + 1)))  # (chunk,)
+        ti      = (tp + 1e-6) / (tp + alpha * fp + beta * fn + 1e-6)  # (chunk,) per-instance Tversky index, see tversky() above
+        total   = total + ((1 - ti) ** 1.33).sum()   # scalar; same focal-style exponent as tversky()'s gamma, applied per instance here
+    return total / n_comp                            # scalar, mean over instances (dividing by n_comp, not voxel count)
+    return total / n_comp                            # scalar, mean over instances
+
+
+_SMALL_INSTANCE_VOXELS = 27  # proxy for BraTS's "<27mm3 = small lesion" cutoff, assumes ~1mm3 voxels
+_SATURATION_MARGIN = 0.35    # plain-Dice safety margin above the real detection bar (DSC>=0.2)
+
+def saturating_blob_term(p, comp_labels, n_comp, alpha=0.3, beta=0.7,
+                          small_voxel_thresh=_SMALL_INSTANCE_VOXELS, margin=_SATURATION_MARGIN):
+    """
+    Same per-instance isolation/chunking as blob_term, but stops pushing gradient on small
+    instances once they clear a safety margin above the real BraTS lesion-wise detection bar.
+
+    Large instances (>= small_voxel_thresh voxels) are untouched — they're scored on real
+    DSC for the segmentation leaderboard, so they still need to be pushed toward ti=1.
+
+    The saturation gate uses plain Dice (alpha=beta=0.5), not this function's own
+    recall-biased `ti` (alpha=0.3, beta=0.7) — the real eval match criterion is DSC>=0.2,
+    and `ti` is a different number than DSC for the same TP/FP/FN (harsher on FN-heavy
+    errors, since beta>alpha), so gating on `ti` directly would drift from what "detected"
+    actually means. Below the margin, the loss shape is identical to blob_term's.
+    """
+    if n_comp == 0 or n_comp > _BLOB_MAX:
+        return p.new_tensor(0.0)                    # scalar
+    all_fg = (comp_labels > 0).float()               # (*spatial)
+    cl_exp = comp_labels.unsqueeze(0)                # (1, *spatial)
+    ndim   = p.ndim                                  # spatial rank, e.g. 3
+    total  = p.new_tensor(0.0)                        # scalar accumulator
+    for start in range(1, n_comp + 1, _BLOB_CHUNK):
+        ids     = torch.arange(start, min(start + _BLOB_CHUNK, n_comp + 1), device=p.device)  # (chunk,)
+        chunk   = len(ids)
+        ids_    = ids.view(chunk, *([1] * ndim))     # (chunk, 1, 1, 1)
+        gi      = (cl_exp == ids_).float()          # (chunk, *spatial) — this instance's GT mask
+        pi      = p.unsqueeze(0) * (1 - (all_fg - gi).clamp(0, 1))  # (chunk, *spatial) — pred, isolated per instance
+        tp      = (pi * gi).sum(dim=tuple(range(1, ndim + 1)))       # (chunk,)
+        fp      = (pi * (1 - gi)).sum(dim=tuple(range(1, ndim + 1)))  # (chunk,)
+        fn      = ((1 - pi) * gi).sum(dim=tuple(range(1, ndim + 1)))  # (chunk,)
+        # instance voxel count == tp+fn == gi.sum(), computed directly from gi (independent of pi)
+        instance_size = gi.sum(dim=tuple(range(1, ndim + 1)))         # (chunk,)
+
+        ti   = (tp + 1e-6) / (tp + alpha * fp + beta * fn + 1e-6)    # (chunk,) — same recall-biased index as blob_term
+        dice = (2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)           # (chunk,) — plain Dice, matches the real match criterion
+
+        saturate = (instance_size < small_voxel_thresh) & (dice > margin)  # (chunk,) bool
+        # where saturated: use ti.detach() (same value, zero gradient). where not: normal ti,
+        # full gradient flows as in blob_term. torch.where selects per-element grad-vs-no-grad.
+        ti_for_loss = torch.where(saturate, ti.detach(), ti)          # (chunk,)
+
+        total = total + ((1 - ti_for_loss) ** 1.33).sum()   # scalar, accumulated across chunks
+    return total / n_comp                            # scalar, mean over instances
+
+
+def saturating_region_loss(p, g, comp_labels, n_comp, lam=1.5,
+                            small_voxel_thresh=_SMALL_INSTANCE_VOXELS, margin=_SATURATION_MARGIN):
+    # p, g, comp_labels: (*spatial) — single batch element, whole TC|RC region (not per-instance)
+    p_c = p.clamp(1e-6, 1 - 1e-6)                    # (*spatial)
+    bce = -(g * p_c.log() + (1 - g) * (1 - p_c).log()).mean()  # scalar
+    blob = saturating_blob_term(p, comp_labels, n_comp,
+                                 small_voxel_thresh=small_voxel_thresh, margin=margin)
+    return tversky(p, g) + bce + lam * blob          # scalar
 
 
 def region_loss(p, g, comp_labels, n_comp, lam=1.5):
-    p_c = p.clamp(1e-6, 1 - 1e-6)
-    bce = -(g * p_c.log() + (1 - g) * (1 - p_c).log()).mean()
-    return tversky(p, g) + bce + lam * blob_term(p, comp_labels, n_comp)
+    # p, g, comp_labels: (*spatial) — single batch element, whole TC|RC region (not per-instance)
+    p_c = p.clamp(1e-6, 1 - 1e-6)                    # (*spatial)
+    bce = -(g * p_c.log() + (1 - g) * (1 - p_c).log()).mean()  # scalar
+    # NB: tversky() expects (B, *spatial) and reduces dims 1..ndim-1, keeping dim 0 as "batch".
+    # p, g here have no batch dim, so dim 0 (depth) is what gets kept -> this computes a
+    # per-depth-slice Tversky index, then .mean() averages over depth (not one whole-volume TI).
+    return tversky(p, g) + bce + lam * blob_term(p, comp_labels, n_comp)  # scalar
 
 
 class BlobRegionWrapper(nn.Module):
@@ -128,50 +211,56 @@ class BlobRegionWrapper(nn.Module):
     CC computation runs on CPU per batch element (scipy); acceptable at batch_size=2.
     """
 
-    def __init__(self, ds_loss, blob_weight: float = 0.5, ignore_label=None):
+    def __init__(self, ds_loss, blob_weight: float = 0.5, ignore_label=None, region_loss_fn=region_loss):
         super().__init__()
         self.ds_loss = ds_loss
         self.blob_weight = blob_weight
         self.ignore_label = ignore_label if ignore_label is not None else -100
+        self.region_loss_fn = region_loss_fn
 
     def forward(self, net_output, target):
+        # net_output: list of (B, C, *spatial) logits, one per DS scale, or a single (B, C, *spatial)
+        # target: matching list/single of (B, 1 or 2, *spatial) — 2 channels when comp_labels is attached
         # strip comp_labels channel before passing to DS loss (expects only seg labels)
         if isinstance(target, (list, tuple)):
             target_seg = [t[:, :1] if t.shape[1] > 1 else t for t in target]
         else:
             target_seg = target[:, :1] if target.shape[1] > 1 else target
 
-        main_loss = self.ds_loss(net_output, target_seg)
-        full_logits = net_output[0] if isinstance(net_output, (list, tuple)) else net_output
-        full_target = target[0] if isinstance(target, (list, tuple)) else target
+        main_loss = self.ds_loss(net_output, target_seg)         # scalar
+        full_logits = net_output[0] if isinstance(net_output, (list, tuple)) else net_output  # (B, C, *spatial), highest-res DS head only
+        full_target = target[0] if isinstance(target, (list, tuple)) else target              # (B, 1 or 2, *spatial)
         # disable autocast: binary_cross_entropy is unsafe in AMP context
         with torch.amp.autocast(full_logits.device.type, enabled=False):
-            blob_loss = self._tc_rc_blob_loss(full_logits.float(), full_target)
+            blob_loss = self._tc_rc_blob_loss(full_logits.float(), full_target)  # scalar
         return main_loss + self.blob_weight * blob_loss
 
     def _tc_rc_blob_loss(self, logits, seg):
+        # logits: (B, C, *spatial); seg: (B, 1 or 2, *spatial) — channel 1, if present, is comp_labels
         probs = F.softmax(logits, dim=1)          # (B, C, *spatial)
-        tc_rc_prob = (probs[:, 1] + probs[:, 3] + probs[:, 4]).clamp(0.0, 1.0)  # NETC + ET + RC
+        # sums per-class probs (NETC + ET + RC channels) into one region prob map, channel dim gone
+        tc_rc_prob = (probs[:, 1] + probs[:, 3] + probs[:, 4]).clamp(0.0, 1.0)  # (B, *spatial)
 
-        seg_3d = seg[:, 0].long()                 # (B, *spatial)
-        valid = seg_3d != self.ignore_label
-        tc_rc_gt = ((seg_3d == 1) | (seg_3d == 3) | (seg_3d == 4)).float()
-        tc_rc_gt = tc_rc_gt * valid.float()
+        seg_3d = seg[:, 0].long()                 # (B, *spatial) — the real segmentation labels
+        valid = seg_3d != self.ignore_label        # (B, *spatial)
+        tc_rc_gt = ((seg_3d == 1) | (seg_3d == 3) | (seg_3d == 4)).float()  # (B, *spatial)
+        tc_rc_gt = tc_rc_gt * valid.float()        # (B, *spatial)
 
         # comp_labels precomputed in data loader and passed as seg channel 1
         has_precomputed = seg.shape[1] >= 2
-        loss = logits.new_tensor(0.0)
+        loss = logits.new_tensor(0.0)              # scalar accumulator
         for b in range(logits.shape[0]):
             if has_precomputed:
-                comp_labels = seg[b, 1].long().to(logits.device)
+                comp_labels = seg[b, 1].long().to(logits.device)   # (*spatial)
                 n_comp = int(comp_labels.max().item())
             else:
                 import scipy.ndimage
-                gt_np = tc_rc_gt[b].cpu().numpy()
-                comp_np, n_comp = scipy.ndimage.label(gt_np)
-                comp_labels = torch.from_numpy(comp_np).to(logits.device)
-            loss = loss + region_loss(tc_rc_prob[b], tc_rc_gt[b], comp_labels, n_comp)
-        return loss / logits.shape[0]
+                gt_np = tc_rc_gt[b].cpu().numpy()                  # (*spatial), numpy
+                comp_np, n_comp = scipy.ndimage.label(gt_np)        # (*spatial), numpy
+                comp_labels = torch.from_numpy(comp_np).to(logits.device)  # (*spatial)
+            # tc_rc_prob[b], tc_rc_gt[b], comp_labels: (*spatial) — single batch element, fed to region_loss_fn
+            loss = loss + self.region_loss_fn(tc_rc_prob[b], tc_rc_gt[b], comp_labels, n_comp)
+        return loss / logits.shape[0]              # scalar, mean over batch
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -339,6 +428,8 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
     - Instance-uniform foreground patch sampling
     """
 
+    _region_loss_fn = staticmethod(region_loss)  # override in subclasses to swap the blob-loss shape
+
     def _build_loss(self):
         assert not self.label_manager.has_regions, \
             "nnUNetTrainerBraTS expects label-based (not region-based) training"
@@ -358,13 +449,18 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
 
         if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
-            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
-            weights[-1] = 0
-            weights = weights / weights.sum()
+            weights = self._get_ds_loss_weights(deep_supervision_scales)
             loss = DeepSupervisionWrapper(loss, weights)
 
         return BlobRegionWrapper(loss, blob_weight=0.5,
-                                 ignore_label=self.label_manager.ignore_label)
+                                 ignore_label=self.label_manager.ignore_label,
+                                 region_loss_fn=self._region_loss_fn)
+
+    def _get_ds_loss_weights(self, deep_supervision_scales) -> np.ndarray:
+        # halve the weight per scale (finest=1, then 1/2, 1/4, ...), coarsest scale zeroed
+        weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+        weights[-1] = 0
+        return weights / weights.sum()
 
     def _class_balanced_sampling_weights(self, dataset_tr) -> np.ndarray:
         """
@@ -495,6 +591,137 @@ class nnUNetTrainerBraTSBlobLoss_2epochs(nnUNetTrainerBraTSBlobLoss):
 
 
 class nnUNetTrainerBraTSBlobLoss_250epochs(nnUNetTrainerBraTSBlobLoss):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturating(nnUNetTrainerBraTSBlobLoss):
+    """
+    Same as nnUNetTrainerBraTSBlobLoss, but small (<27 voxel) TC|RC instances stop
+    accumulating blob-loss gradient once their plain Dice clears a safety margin (0.35)
+    above the real BraTS lesion-wise detection bar (DSC>=0.2). Large instances are
+    unaffected. See saturating_blob_term / saturating_region_loss.
+    """
+    _region_loss_fn = staticmethod(saturating_region_loss)
+
+
+class nnUNetTrainerBraTSBlobLossSaturating_2epochs(nnUNetTrainerBraTSBlobLossSaturating):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 2
+
+
+class nnUNetTrainerBraTSBlobLossSaturating_250epochs(nnUNetTrainerBraTSBlobLossSaturating):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingWarmStart(nnUNetTrainerBraTSBlobLossSaturating):
+    """
+    For warm-starting from a DIFFERENT trainer/config's checkpoint via -pretrained_weights
+    (e.g. coarse-res nnUNetTrainerBraTS_750epochs -> this highres+blob-loss trainer).
+    -pretrained_weights only loads network weights; epoch/optimizer/LR schedule all reset
+    to 0, so nnU-Net's default initial_lr=1e-2 would restart at full strength on already-
+    converged weights. That previously stalled RC's fragile learned features for ~180
+    epochs in an earlier warm start (see memory/current-baseline.md). Uses a 10x lower
+    initial_lr with a short linear warmup (WarmupPolyLRScheduler) instead — this is the
+    first use case where the warmup phase actually activates (a genuine epoch-0 start),
+    unlike a load_checkpoint-based resume mid-schedule where it's a no-op past epoch ~10.
+    """
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.initial_lr = 1e-3
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr,
+                                    weight_decay=self.weight_decay, momentum=0.99, nesterov=True)
+        lr_scheduler = WarmupPolyLRScheduler(optimizer, self.initial_lr, self.num_epochs, warmup_steps=10)
+        return optimizer, lr_scheduler
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingWarmStart_250epochs(nnUNetTrainerBraTSBlobLossSaturatingWarmStart):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingFewDS(nnUNetTrainerBraTSBlobLossSaturating):
+    """
+    Same as nnUNetTrainerBraTSBlobLossSaturating, but zeros deep-supervision loss weight
+    for every scale coarser than 1/2 (not just the coarsest, which the base class already
+    zeros). At 3d_fullres (patch 96x160x160, 5 DS scales: 1, 1/2, 1/4, 1/8, 1/16), a small
+    (~27 voxel, i.e. ~3-voxel-cube) lesion is already sub-voxel by the 1/4 scale — the DS
+    ground truth there has effectively erased it, so that DS head is trained to predict
+    background exactly where a small lesion exists in the full-res label. The base class's
+    weights ([0.53, 0.27, 0.13, 0.07, 0] after zeroing only the last) still gave that
+    1/4-scale head 13% of the DS loss and the 1/8-scale head 7% — both already past the
+    point where small lesions survive downsampling. This zeros scales 2 and up, keeping
+    only full-res (weight 2/3) and 1/2 (weight 1/3).
+    """
+    def _get_ds_loss_weights(self, deep_supervision_scales) -> np.ndarray:
+        weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+        weights[2:] = 0
+        return weights / weights.sum()
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingFewDS_250epochs(nnUNetTrainerBraTSBlobLossSaturatingFewDS):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingFewDSWarmStart(
+    nnUNetTrainerBraTSBlobLossSaturatingWarmStart,
+    nnUNetTrainerBraTSBlobLossSaturatingFewDS,
+):
+    """Combines the reduced-LR warm-start fix with the reduced deep-supervision scales."""
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingFewDSWarmStart_250epochs(nnUNetTrainerBraTSBlobLossSaturatingFewDSWarmStart):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingHighres(nnUNetTrainerBraTSBlobLossSaturating):
+    """
+    Same as nnUNetTrainerBraTSBlobLossSaturating, but recalibrated for the 3d_highres config's
+    finer in-plane spacing ([1, 0.5, 0.5]mm, voxel volume 0.25mm3 vs fullres's 0.77mm3). The
+    base class's small_voxel_thresh=27 assumes ~1mm3 voxels (already an approximation at
+    fullres, where 27mm3 is actually ~35 voxels); at highres a real 27mm3 lesion is ~108
+    voxels, not 27, so the base default would misclassify genuinely-small lesions as "large"
+    and never saturate them. Uses small_voxel_thresh=108 instead; margin (plain-Dice-based,
+    dimensionless, not spacing-dependent) is unchanged.
+    """
+    _region_loss_fn = staticmethod(functools.partial(saturating_region_loss, small_voxel_thresh=108))
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingFewDSHighres(nnUNetTrainerBraTSBlobLossSaturatingHighres):
+    """
+    Same recalibration idea as FewDS, but for highres spacing: a 27mm3 lesion is ~108 voxels
+    (~4.76-voxel cube) at highres vs ~35 voxels (~3.27-voxel cube) at fullres, so it survives
+    one more downsampling level before going sub-voxel — at 1/4 scale it's still ~1.19 voxels
+    (borderline visible), only vanishing (~0.6 voxels) at 1/8. Zeros DS weight from scale index
+    3 (1/8) onward instead of index 2 (1/4, what FewDS uses for fullres), keeping full-res,
+    1/2, and 1/4 all contributing.
+    """
+    def _get_ds_loss_weights(self, deep_supervision_scales) -> np.ndarray:
+        weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+        weights[3:] = 0
+        return weights / weights.sum()
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingFewDSHighresWarmStart(
+    nnUNetTrainerBraTSBlobLossSaturatingWarmStart,
+    nnUNetTrainerBraTSBlobLossSaturatingFewDSHighres,
+):
+    """Combines the reduced-LR warm-start fix with the highres-recalibrated saturation + DS scales."""
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingFewDSHighresWarmStart_250epochs(
+        nnUNetTrainerBraTSBlobLossSaturatingFewDSHighresWarmStart):
     def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 250
