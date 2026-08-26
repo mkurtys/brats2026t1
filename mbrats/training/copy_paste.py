@@ -66,7 +66,7 @@ def find_valid_offset(valid_mask: np.ndarray, instance_shape, rng: np.random.Gen
 
 
 def compute_instance_weights(library: list, size_key: str = 'wt', bias_power: float = 1.0,
-                              min_size: int = 10) -> np.ndarray:
+                              min_size: int = 10, rc_target: float = 0.0) -> np.ndarray:
     """
     Sampling weights favoring small instances (1 / size ** bias_power),
     further divided by how many instances came from the same case, so a
@@ -81,6 +81,14 @@ def compute_instance_weights(library: list, size_key: str = 'wt', bias_power: fl
     eda/size_weight_distribution.png), which paste as invisible single-pixel
     label noise and measurably hurt small-lesion recall in practice (see
     results/copypaste250_fold0_cv_eval.* vs brats_500 baseline).
+
+    `rc_target` (0 = off, backward compatible): guarantee RC-containing
+    instances collectively receive this fraction of the sampling mass. RC is
+    only ~2% of the library and RC cavities are large, so the 1/size term
+    otherwise buries them (~1% of draws). When set, RC instances are sampled
+    *per-case* rather than by 1/size — RC cavities being large, 1/size would
+    collapse RC onto a handful of tiny fragments (~6 effective shapes of 212);
+    per-case spreads across the ~165 RC cases (~127 effective shapes).
     """
     if size_key == 'tc':
         sizes = np.array([inst['n_voxels_netc'] + inst['n_voxels_et'] + inst['n_voxels_rc'] for inst in library])
@@ -96,6 +104,14 @@ def compute_instance_weights(library: list, size_key: str = 'wt', bias_power: fl
     per_case_weight = np.array([1.0 / case_counts[inst['case_id']] for inst in library])
 
     weights = (1.0 / sizes ** bias_power) * per_case_weight * eligible
+
+    if rc_target > 0:
+        has_rc = np.array([inst['n_voxels_rc'] > 0 for inst in library]) & eligible
+        rc_w = per_case_weight * has_rc                 # diversity: per-case within RC, not 1/size
+        non_w = weights * ~has_rc                        # unchanged 1/size logic for everything else
+        if rc_w.sum() > 0 and non_w.sum() > 0:
+            weights = rc_w / rc_w.sum() * rc_target + non_w / non_w.sum() * (1.0 - rc_target)
+
     return weights / weights.sum()
 
 

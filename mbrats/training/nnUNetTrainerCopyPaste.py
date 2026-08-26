@@ -24,6 +24,7 @@ from batchgenerators.utilities.file_and_folder_operations import load_pickle
 from threadpoolctl import threadpool_limits
 
 from copy_paste import compute_instance_weights, find_valid_offset, paste_instance
+from mbrats.training.lr_schedules import WarmupPolyLRScheduler
 from nnUNetTrainerBraTS import nnUNetDataLoaderInstanceUniform, nnUNetTrainerBraTS
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 
@@ -40,10 +41,11 @@ class nnUNetDataLoaderCopyPaste(nnUNetDataLoaderInstanceUniform):
 
     def __init__(self, *args, lesion_library: list, paste_location_folder: str,
                  paste_probability: float = 0.5, max_pastes_per_sample: int = 2,
-                 wt_fraction: float = 0.5, **kwargs):
+                 wt_fraction: float = 0.5, rc_target: float = 0.07, **kwargs):
         super().__init__(*args, **kwargs)
         self.lesion_library = lesion_library
-        self.instance_weights = compute_instance_weights(lesion_library) if lesion_library else None
+        self.instance_weights = (compute_instance_weights(lesion_library, rc_target=rc_target)
+                                 if lesion_library else None)
         self.paste_location_folder = Path(paste_location_folder)
         self.paste_probability = paste_probability
         self.max_pastes_per_sample = max_pastes_per_sample
@@ -57,9 +59,10 @@ class nnUNetDataLoaderCopyPaste(nnUNetDataLoaderInstanceUniform):
         return blosc2.open(str(path))[:]
 
     def _paste_into_sample(self, data_cropped: np.ndarray, seg_cropped: np.ndarray, case_id: str, bbox):
-        if not self.lesion_library or self._paste_rng.random() > self.paste_probability:
+        if not self.lesion_library:
+            raise Exception("No lesion library built")
+        if self._paste_rng.random() > self.paste_probability:
             return
-
         full_valid_mask = self._load_paste_mask(case_id)
         if full_valid_mask is None:
             return
@@ -160,6 +163,7 @@ class nnUNetTrainerBraTSCopyPaste(nnUNetTrainerBraTS):
     LESION_LIBRARY_NAME = 'lesion_library.pkl'
     PASTE_PROBABILITY = 0.5
     MAX_PASTES_PER_SAMPLE = 2
+    RC_TARGET = 0.07  # fraction of paste draws forced to be RC-containing (see compute_instance_weights)
 
     def get_dataloaders(self):
         from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
@@ -195,7 +199,8 @@ class nnUNetTrainerBraTSCopyPaste(nnUNetTrainerBraTS):
 
         library_path = os.path.join(os.path.dirname(self.preprocessed_dataset_folder), self.LESION_LIBRARY_NAME)
         lesion_library = load_pickle(library_path)
-        self.print_to_log_file(f'Copy-paste: loaded {len(lesion_library)} instances from {library_path}')
+        self.print_to_log_file(f'Copy-paste: loaded {len(lesion_library)} instances from {library_path} '
+                               f'(rc_target={self.RC_TARGET})')
 
         dl_tr = nnUNetDataLoaderCopyPaste(
             dataset_tr, self.batch_size,
@@ -206,9 +211,10 @@ class nnUNetTrainerBraTSCopyPaste(nnUNetTrainerBraTS):
             sampling_probabilities=sampling_weights, pad_sides=None, transforms=tr_transforms,
             probabilistic_oversampling=self.probabilistic_oversampling,
             lesion_library=lesion_library,
-            paste_location_folder=self.preprocessed_dataset_folder,
+            paste_location_folder=str(self.preprocessed_dataset_folder) + '_pastemasks',
             paste_probability=self.PASTE_PROBABILITY,
             max_pastes_per_sample=self.MAX_PASTES_PER_SAMPLE,
+            rc_target=self.RC_TARGET,
         )
         dl_val = nnUNetDataLoaderInstanceUniform(
             dataset_val, self.batch_size,
@@ -252,3 +258,28 @@ class nnUNetTrainerBraTSCopyPaste_20epochs(nnUNetTrainerBraTSCopyPaste):
     def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 20
+
+
+class nnUNetTrainerBraTSCopyPasteWarmStart(nnUNetTrainerBraTSCopyPaste):
+    """Warm-start copy-paste from another trainer's checkpoint via -pretrained_weights
+    (epoch-0 start, weights only). initial_lr 1e-3 + a short linear warmup
+    (WarmupPolyLRScheduler, warmup_steps=10), same rationale and setup as
+    nnUNetTrainerBraTSBlobLossSaturatingWarmStart: a full-strength 1e-2 restart on
+    already-converged weights previously stalled RC's fragile features for ~180 epochs.
+    Warmup only meaningfully activates on this genuine epoch-0 start (not a mid-schedule
+    resume)."""
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.initial_lr = 1e-3
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr,
+                                    weight_decay=self.weight_decay, momentum=0.99, nesterov=True)
+        lr_scheduler = WarmupPolyLRScheduler(optimizer, self.initial_lr, self.num_epochs, warmup_steps=10)
+        return optimizer, lr_scheduler
+
+
+class nnUNetTrainerBraTSCopyPasteWarmStart_250epochs(nnUNetTrainerBraTSCopyPasteWarmStart):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250

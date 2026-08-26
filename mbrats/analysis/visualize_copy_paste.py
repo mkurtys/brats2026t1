@@ -25,6 +25,7 @@ from copy_paste import compute_instance_weights, find_valid_offset, paste_instan
 from mbrats.view_case import LABEL_COLORS, LABEL_NAMES, apply_overlay  # noqa: E402
 
 DATA_FOLDER = Path("nnunet_preprocessed/Dataset001_BraTSMETS/nnUNetPlans_3d_fullres")
+PASTEMASK_FOLDER = Path("nnunet_preprocessed/Dataset001_BraTSMETS/nnUNetPlans_3d_fullres_pastemasks")
 LIBRARY_PATH = Path("nnunet_preprocessed/Dataset001_BraTSMETS/lesion_library.pkl")
 # channel order: 0=T1, 1=T1CE (contrast), 2=T2, 3=FLAIR
 MODALITIES = [(1, 'T1CE'), (3, 'FLAIR')]
@@ -99,7 +100,7 @@ def main():
 
     image = blosc2.open(str(DATA_FOLDER / f"{args.case_id}.b2nd"))[:]
     seg = blosc2.open(str(DATA_FOLDER / f"{args.case_id}_seg.b2nd"))[:][0]
-    valid_mask_full = blosc2.open(str(DATA_FOLDER / f"{args.case_id}_pastemask.b2nd"))[:]
+    valid_mask_full = blosc2.open(str(PASTEMASK_FOLDER / f"{args.case_id}_pastemask.b2nd"))[:]
 
     library = load_pickle(str(LIBRARY_PATH))
     weights = compute_instance_weights(library)

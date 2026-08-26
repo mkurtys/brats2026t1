@@ -50,3 +50,17 @@ Ranking details:
 We will follow the DELPHI-based recommendations for image analysis validation [1,2], incorporating i) algorithmic ranking, and ii) statistical significance testing. For ranking of multidimensional outcomes (or metrics), for each team, we will compute the summation of their ranks across the average of the metrics described above as a univariate overall summary measure. This measure will decide the overall ranking for each specific team. All teams will then be placed in a ranked order and their average rankings will be randomly permuted (i.e., 500,000 permutations), in a pair-wise manner. Corresponding pairwise p-values will be computed to determine the pair-wise statistical significance and report actual differences between the ordered ranked approaches. These p-values will be reported in an upper triangular matrix revealing the statistical insignificance of potential teams that will be grouped together in tiers and the significant superiority among others that we will clearly indicate. This is an evolved version of the systematic ranking that has been used on previous years for BraTS and other challenges, and will be packaged & distributed as an independent tool allowing reproducibility and use in other challenges.
 
 For the cases in which the algorithm fails to produce a result metric for a specific test case, there will be no penalties, i.e. the metric won't be set to its worst possible value (e.g., 0 for the DSC and the NSD).
+
+
+# Files submission
+
+Tasks 1 - 3: Segmentation Tasks (NIfTI)
+
+For each task, the submission must be a single zip (*.zip) or tarball (*.tar[.gz]) containing your prediction files for that task. You may name this compressed file whatever you like.
+
+All individual files must be in NIfTI format and use the nii.gz file extension.
+
+Submitted data files must precisely match the spatial characteristics of their corresponding images. The array dimensions, voxel spacing, image origin, and spatial orientation must be identical to the source images. This is especially important for the Metastasis task, as this dataset is in its native space, which inherently includes variability. Discrepancies will lead to scoring issues and submission invalidation. You may use CaPTk to verify and/or visualize your files.
+
+Output filenames must end with the 5-digit case ID and 3-digit timepoint (found in the folder name), followed directly by .nii.gz.
+

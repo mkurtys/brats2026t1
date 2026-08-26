@@ -124,11 +124,18 @@ def build_masks(folder: Path, force: bool = False):
     if not seg_files:
         raise SystemExit(f"No *_seg.b2nd files found in {folder}")
 
+    # Write pastemasks to a sibling folder, NOT into the nnU-Net data folder:
+    # nnUNetv2_train -f all enumerates cases by scanning the data folder, and
+    # co-located *_pastemask.b2nd files get mistaken for cases (looked-up seg
+    # then missing). Trainer reads them from '<data_folder>_pastemasks' too.
+    out_folder = Path(str(folder) + "_pastemasks")
+    out_folder.mkdir(parents=True, exist_ok=True)
+
     already_done = 0
     fractions = []
     for seg_path in tqdm(seg_files, desc="Computing paste location masks"):
         case_id = seg_path.name[:-len("_seg.b2nd")]
-        out_path = folder / f"{case_id}_pastemask.b2nd"
+        out_path = out_folder / f"{case_id}_pastemask.b2nd"
         if out_path.exists() and not force:
             already_done += 1
             continue

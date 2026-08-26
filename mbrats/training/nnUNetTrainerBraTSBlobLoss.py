@@ -184,14 +184,14 @@ def saturating_blob_term(p, comp_labels, n_comp, alpha=0.3, beta=0.7,
     return total / n_comp                            # scalar, mean over instances
 
 
-def saturating_region_loss(p, g, comp_labels, n_comp, lam=1.5,
+def saturating_region_loss(p, g, comp_labels, n_comp, lam=1.5, alpha=0.3, beta=0.7,
                             small_voxel_thresh=_SMALL_INSTANCE_VOXELS, margin=_SATURATION_MARGIN):
     # p, g, comp_labels: (*spatial) — single batch element, whole TC|RC region (not per-instance)
     p_c = p.clamp(1e-6, 1 - 1e-6)                    # (*spatial)
     bce = -(g * p_c.log() + (1 - g) * (1 - p_c).log()).mean()  # scalar
-    blob = saturating_blob_term(p, comp_labels, n_comp,
+    blob = saturating_blob_term(p, comp_labels, n_comp, alpha=alpha, beta=beta,
                                  small_voxel_thresh=small_voxel_thresh, margin=margin)
-    return tversky(p, g) + bce + lam * blob          # scalar
+    return tversky(p, g, alpha=alpha, beta=beta) + bce + lam * blob  # scalar
 
 
 def region_loss(p, g, comp_labels, n_comp, lam=1.5):
@@ -209,14 +209,31 @@ class BlobRegionWrapper(nn.Module):
     Wraps a deep-supervision loss and adds a TC|RC blob region loss at full resolution.
     TC|RC = NETC (ch 1) + ET (ch 3) + RC (ch 4).
     CC computation runs on CPU per batch element (scipy); acceptable at batch_size=2.
+
+    Two modes, selected by whether rc_region_loss_fn is given:
+      - combined (default, rc_region_loss_fn=None): single CC pass over NETC|ET|RC
+        together via region_loss_fn — the original behaviour. Since resection cavities
+        routinely touch residual tumor, this frequently MERGES an RC instance into the
+        same connected component as adjacent ET/NETC, so RC voxels end up scored under
+        whatever alpha/beta the merged blob gets, not an RC-specific one.
+      - split (rc_region_loss_fn given): TWO independent CC passes computed from scratch
+        each step — TC (NETC|ET) via region_loss_fn, RC (RC only) via rc_region_loss_fn —
+        so RC gets its own alpha/beta/saturation gate, decoupled from TC's. Costs one
+        extra scipy.ndimage.label call per batch element per step (not offloaded to the
+        dataloader workers, unlike the combined path's precomputed-comp_labels fast path).
     """
 
-    def __init__(self, ds_loss, blob_weight: float = 0.5, ignore_label=None, region_loss_fn=region_loss):
+    def __init__(self, ds_loss, blob_weight: float = 0.5, ignore_label=None,
+                 region_loss_fn=region_loss, rc_region_loss_fn=None,
+                 tc_weight: float = 1.0, rc_weight: float = 1.0):
         super().__init__()
         self.ds_loss = ds_loss
         self.blob_weight = blob_weight
         self.ignore_label = ignore_label if ignore_label is not None else -100
         self.region_loss_fn = region_loss_fn
+        self.rc_region_loss_fn = rc_region_loss_fn
+        self.tc_weight = tc_weight
+        self.rc_weight = rc_weight
 
     def forward(self, net_output, target):
         # net_output: list of (B, C, *spatial) logits, one per DS scale, or a single (B, C, *spatial)
@@ -236,6 +253,11 @@ class BlobRegionWrapper(nn.Module):
         return main_loss + self.blob_weight * blob_loss
 
     def _tc_rc_blob_loss(self, logits, seg):
+        if self.rc_region_loss_fn is None:
+            return self._combined_blob_loss(logits, seg)
+        return self._split_blob_loss(logits, seg)
+
+    def _combined_blob_loss(self, logits, seg):
         # logits: (B, C, *spatial); seg: (B, 1 or 2, *spatial) — channel 1, if present, is comp_labels
         probs = F.softmax(logits, dim=1)          # (B, C, *spatial)
         # sums per-class probs (NETC + ET + RC channels) into one region prob map, channel dim gone
@@ -260,6 +282,37 @@ class BlobRegionWrapper(nn.Module):
                 comp_labels = torch.from_numpy(comp_np).to(logits.device)  # (*spatial)
             # tc_rc_prob[b], tc_rc_gt[b], comp_labels: (*spatial) — single batch element, fed to region_loss_fn
             loss = loss + self.region_loss_fn(tc_rc_prob[b], tc_rc_gt[b], comp_labels, n_comp)
+        return loss / logits.shape[0]              # scalar, mean over batch
+
+    def _split_blob_loss(self, logits, seg):
+        # TC (NETC|ET) and RC scored independently: own CCs, own alpha/beta, so an RC
+        # instance touching adjacent tumor is no longer merged into TC's blob (see class
+        # docstring). comp_labels precomputed for the combined mask (seg channel 1) is NOT
+        # reusable here — a merged id in it may mix TC and RC voxels — so both regions'
+        # CCs are computed fresh from the seg labels every step.
+        import scipy.ndimage
+        probs = F.softmax(logits, dim=1)          # (B, C, *spatial)
+        seg_3d = seg[:, 0].long()                 # (B, *spatial)
+        valid = (seg_3d != self.ignore_label).float()  # (B, *spatial)
+
+        tc_prob = (probs[:, 1] + probs[:, 3]).clamp(0.0, 1.0)          # (B, *spatial) — NETC + ET
+        tc_gt = ((seg_3d == 1) | (seg_3d == 3)).float() * valid        # (B, *spatial)
+        rc_prob = probs[:, 4].clamp(0.0, 1.0)                          # (B, *spatial) — RC only
+        rc_gt = (seg_3d == 4).float() * valid                          # (B, *spatial)
+
+        loss = logits.new_tensor(0.0)              # scalar accumulator
+        for b in range(logits.shape[0]):
+            tc_np = tc_gt[b].detach().cpu().numpy()
+            tc_comp_np, tc_n = scipy.ndimage.label(tc_np)
+            tc_comp = torch.from_numpy(tc_comp_np).to(logits.device)
+
+            rc_np = rc_gt[b].detach().cpu().numpy()
+            rc_comp_np, rc_n = scipy.ndimage.label(rc_np)
+            rc_comp = torch.from_numpy(rc_comp_np).to(logits.device)
+
+            tc_loss = self.region_loss_fn(tc_prob[b], tc_gt[b], tc_comp, tc_n)
+            rc_loss = self.rc_region_loss_fn(rc_prob[b], rc_gt[b], rc_comp, rc_n)
+            loss = loss + self.tc_weight * tc_loss + self.rc_weight * rc_loss
         return loss / logits.shape[0]              # scalar, mean over batch
 
 
@@ -305,13 +358,17 @@ class nnUNetDataLoaderInstanceUniform(nnUNetDataLoader):
     Falls back to voxel-uniform (parent behaviour) if tc_rc_instances is absent.
     """
 
+    # probs ∝ size**exponent. 1.0 = size-proportional (large lesions dominate),
+    # 0.5 = sqrt compromise (default), 0.0 = fully instance-uniform (every instance,
+    # regardless of size, gets equal selection probability — maximum small-lesion weight).
+    _instance_size_exponent = 0.5
+
     def _instance_uniform_bbox(self, shape: tuple, properties: dict):
         """
-        Returns (bbox_lbs, bbox_ubs) centered on a sqrt-size-weighted TC instance.
+        Returns (bbox_lbs, bbox_ubs) centered on a size**_instance_size_exponent-weighted
+        TC instance.
 
         tc_rc_instances is a flat list of CC arrays (ET | NETC combined mask).
-        Instances are selected with sqrt(n_voxels) weighting so large lesions get
-        proportionally more pulls without completely starving small ones.
         """
         need_to_pad = self.need_to_pad.copy()
         dim = len(shape)
@@ -330,9 +387,9 @@ class nnUNetDataLoaderInstanceUniform(nnUNetDataLoader):
             bbox_ubs = [bbox_lbs[i] + self.patch_size[i] for i in range(dim)]
             return bbox_lbs, bbox_ubs
 
-        # pick instance with sqrt-size weighting, then a random voxel within it
+        # pick instance with size**exponent weighting, then a random voxel within it
         sizes = np.array([len(inst) for inst in instances], dtype=np.float64)
-        probs = np.sqrt(sizes); probs /= probs.sum()
+        probs = sizes ** self._instance_size_exponent; probs /= probs.sum()
         chosen_instance = instances[np.random.choice(len(instances), p=probs)]  # (N, 4)
         sv = chosen_instance[np.random.randint(len(chosen_instance))]            # [ch, x, y, z]
         center = [int(sv[i + 1]) for i in range(dim)]  # skip channel col
@@ -417,6 +474,19 @@ class nnUNetDataLoaderInstanceUniform(nnUNetDataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
+class nnUNetDataLoaderInstanceUniformSmallBoost(nnUNetDataLoaderInstanceUniform):
+    """
+    Same as nnUNetDataLoaderInstanceUniform, but exponent=0.25: TC|RC connected components
+    are weighted by size**0.25, between the base class's sqrt(size) [exponent=0.5, still
+    tilts toward larger instances] and fully instance-uniform [exponent=0.0, every instance
+    equal regardless of size]. exponent=0.0 was tried first and over-corrected — it favored
+    small lesions so heavily that large-lesion (DSC) sampling density suffered too much;
+    0.25 keeps a real boost toward small-lesion signal (recall/F1, incl. the 2026 detection
+    leaderboard) without abandoning large-instance exposure entirely.
+    """
+    _instance_size_exponent = 0.25
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Custom trainer
 # ──────────────────────────────────────────────────────────────────────────────
@@ -429,15 +499,25 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
     """
 
     _region_loss_fn = staticmethod(region_loss)  # override in subclasses to swap the blob-loss shape
+    _focal_gamma = 2.0                           # override in subclasses to soften the FP-inflating focal tilt
+    _dataloader_cls = nnUNetDataLoaderInstanceUniform  # override to swap instance-sampling weighting
+    _rc_region_loss_fn = None                    # override to decouple RC from TC (split blob loss)
+    _tc_region_weight = 1.0                      # only used when _rc_region_loss_fn is set
+    _rc_region_weight = 1.0                      # only used when _rc_region_loss_fn is set
+    _focal_class_weights = None                  # override to per-class-weight the focal/CE term (len = num classes incl. background)
 
     def _build_loss(self):
         assert not self.label_manager.has_regions, \
             "nnUNetTrainerBraTS expects label-based (not region-based) training"
 
+        focal_kwargs = {'gamma': self._focal_gamma}
+        if self._focal_class_weights is not None:
+            focal_kwargs['weight'] = torch.tensor(self._focal_class_weights, device=self.device, dtype=torch.float32)
+
         loss = DC_and_Focal_loss(
             soft_dice_kwargs={'batch_dice': self.configuration_manager.batch_dice,
                               'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp},
-            focal_kwargs={'gamma': 2.0},
+            focal_kwargs=focal_kwargs,
             weight_focal=1,
             weight_dice=1,
             ignore_label=self.label_manager.ignore_label,
@@ -454,7 +534,10 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
 
         return BlobRegionWrapper(loss, blob_weight=0.5,
                                  ignore_label=self.label_manager.ignore_label,
-                                 region_loss_fn=self._region_loss_fn)
+                                 region_loss_fn=self._region_loss_fn,
+                                 rc_region_loss_fn=self._rc_region_loss_fn,
+                                 tc_weight=self._tc_region_weight,
+                                 rc_weight=self._rc_region_weight)
 
     def _get_ds_loss_weights(self, deep_supervision_scales) -> np.ndarray:
         # halve the weight per scale (finest=1, then 1/2, 1/4, ...), coarsest scale zeroed
@@ -466,9 +549,11 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
         """
         Per-case sampling probabilities based on inverse class frequency.
 
-        For each case, weight = sum of (n_cases / n_cases_with_class) for every
-        foreground class present. Cases containing rare classes (RC, NETC) get
-        proportionally higher selection probability than common-class-only cases.
+        For each case, weight = max over its present foreground classes of
+        (n_cases / n_cases_with_class) — i.e. the rarity of its rarest class.
+        Cases containing rare classes (RC, NETC) get proportionally higher
+        selection probability than common-class-only cases, regardless of how
+        many other (common) classes also happen to be present.
         """
         from batchgenerators.utilities.file_and_folder_operations import load_pickle
         import os
@@ -477,11 +562,7 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
         case_classes = []
         for key in dataset_tr.identifiers:
             pkl_path = os.path.join(self.preprocessed_dataset_folder, key + '.pkl')
-            try:
-                props = load_pickle(pkl_path)
-            except Exception:
-                case_classes.append(frozenset())
-                continue
+            props = load_pickle(pkl_path)
             locs = props.get('class_locations', {})
             present = frozenset(l for l, voxels in locs.items() if len(voxels) > 0)
             case_classes.append(present)
@@ -499,9 +580,9 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
         for l, w in sorted(inv_freq.items()):
             self.print_to_log_file(f'  label {l}: {class_counts[l]} cases  weight {w:.2f}x')
 
-        # pass 2: per-case weight = sum of inv_freq for its classes
+        # pass 2: per-case weight = max inv_freq over its classes (rarest class wins)
         weights = np.array(
-            [sum(inv_freq[l] for l in present) if present else 1.0 for present in case_classes],
+            [max(inv_freq[l] for l in present) if present else 1.0 for present in case_classes],
             dtype=np.float64,
         )
         return weights / weights.sum()
@@ -544,7 +625,7 @@ class nnUNetTrainerBraTSBlobLoss(nnUNetTrainer):
 
         sampling_weights = self._class_balanced_sampling_weights(dataset_tr)
 
-        dl_tr = nnUNetDataLoaderInstanceUniform(
+        dl_tr = self._dataloader_cls(
             dataset_tr, self.batch_size,
             initial_patch_size,
             self.configuration_manager.patch_size,
@@ -725,3 +806,220 @@ class nnUNetTrainerBraTSBlobLossSaturatingFewDSHighresWarmStart_250epochs(
     def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalanced(nnUNetTrainerBraTSBlobLossSaturating):
+    """
+    Reduces the model's positive/FP bias and increases small-lesion sampling weight, per
+    the 2026-07-22 leaderboard gap analysis: the ET/TC/WT DSC gap is substantially a
+    false-positive problem (the model is deliberately recall-tilted, see loss-vs-metric-audit
+    memory), and RC small-lesion recall is 0 in every run to date. Three changes, all
+    independent of the FewDS/WarmStart mixins:
+
+      1. Tversky alpha/beta 0.3/0.7 -> 0.4/0.6 (both the region-level Tversky and the
+         per-instance blob term) — FN penalized 1.5x FP instead of 2.33x. Still recall-
+         leaning (BraTS boundaries are noisy), just less so; softer than the audit's
+         "don't touch beta" caution because this run is deliberately testing that tradeoff.
+      2. Focal gamma 2.0 -> 1.0 — down-weights easy background less aggressively; the
+         audit's cheapest, least recall-coupled FP lever.
+      3. Instance-sampling exponent sqrt(size) [0.5] -> instance-uniform [0.0]
+         (nnUNetDataLoaderInstanceUniformSmallBoost) — every TC|RC connected component
+         gets equal selection probability regardless of size, maximizing small-lesion
+         patch exposure. This is the OPPOSITE direction from the audit's DSC-only lever
+         (0.5->0.75, which tilts toward large lesions); here we're trading some large-
+         lesion/DSC sampling density for small-lesion recall, aimed at the 2026 detection
+         leaderboard as well as DSC.
+    """
+    _region_loss_fn = staticmethod(functools.partial(saturating_region_loss, alpha=0.4, beta=0.6))
+    _focal_gamma = 1.0
+    _dataloader_cls = nnUNetDataLoaderInstanceUniformSmallBoost
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedFewDSWarmStart(
+    nnUNetTrainerBraTSBlobLossSaturatingWarmStart,
+    nnUNetTrainerBraTSBlobLossSaturatingFewDS,
+    nnUNetTrainerBraTSBlobLossSaturatingBalanced,
+):
+    """Combines the reduced-LR warm-start fix, reduced DS scales, and the lower-positive-
+    bias/higher-small-lesion-weight changes (Balanced). Warm-startable from the current
+    reference checkpoint (nnUNetTrainerBraTSBlobLossSaturatingFewDSWarmStart_250epochs)."""
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedFewDSWarmStart_250epochs(
+        nnUNetTrainerBraTSBlobLossSaturatingBalancedFewDSWarmStart):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRC(nnUNetTrainerBraTSBlobLossSaturatingBalanced):
+    """
+    Same as Balanced, but decouples RC from TC in the blob loss instead of letting RC ride
+    on TC's softened settings. Balanced's combined blob loss (base class) runs ONE
+    connected-components pass over NETC|ET|RC together — since resection cavities
+    routinely touch residual tumor, this frequently MERGES an RC instance into the same
+    blob as adjacent ET/NETC, so RC voxels end up scored under whatever alpha/beta the
+    merged blob gets, not an RC-specific one. Balanced softens alpha/beta (0.3/0.7 ->
+    0.4/0.6) and focal gamma (2.0 -> 1.0) to cut ET/TC/WT's false-positive problem —
+    reasonable there, but RC's small-lesion recall is already 0 in every run to date (see
+    current-baseline memory), so silently inheriting that softening risks making RC's
+    already-worst region worse.
+
+    Uses BlobRegionWrapper's split mode (see its docstring): TC (NETC|ET) and RC get
+    independent connected-components passes each step, so RC keeps its ORIGINAL, more
+    recall-aggressive alpha/beta (0.3/0.7, unchanged from the pre-Balanced baseline) while
+    TC still gets Balanced's softened 0.4/0.6. Bonus: RC's small-instance saturation gate
+    (<27vox, see saturating_blob_term) is now computed on RC's own instance size, not a
+    merged TC+RC blob's size — a more faithful gate than the combined pass ever gave RC.
+
+    Caveat: summing two independent region losses (instead of one pooled combined call)
+    roughly doubles the region-loss-family's magnitude relative to the un-split baseline;
+    the warm-start's low initial_lr + short warmup should absorb this, but
+    _tc_region_weight/_rc_region_weight are exposed on the base class if retuning is
+    needed. Also costs one extra scipy.ndimage.label call per batch element per step (RC's
+    CCs are typically small so shouldn't dominate runtime, but unlike the combined path's
+    precomputed-comp_labels fast path, this one is NOT offloaded to the dataloader workers).
+    """
+    _rc_region_loss_fn = staticmethod(functools.partial(saturating_region_loss, alpha=0.3, beta=0.7))
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDSWarmStart(
+    nnUNetTrainerBraTSBlobLossSaturatingWarmStart,
+    nnUNetTrainerBraTSBlobLossSaturatingFewDS,
+    nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRC,
+):
+    """Combines the reduced-LR warm-start fix, reduced DS scales, and Balanced's TC/ET/WT
+    de-biasing with RC decoupled (kept at the original alpha/beta 0.3/0.7, unaffected by
+    the TC softening). Warm-startable from the current reference checkpoint
+    (nnUNetTrainerBraTSBlobLossSaturatingFewDSWarmStart_250epochs)."""
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDSWarmStart_250epochs(
+        nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDSWarmStart):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 250
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDS(
+    nnUNetTrainerBraTSBlobLossSaturatingFewDS,
+    nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRC,
+):
+    """Combines reduced DS scales with Balanced's TC/ET/WT de-biasing and RC decoupling,
+    WITHOUT the WarmStart mixin — for training from scratch (fresh init) on a new fold,
+    using nnU-Net's default optimizer/LR schedule (SGD, initial_lr=1e-2, poly decay)
+    instead of the WarmStart mixin's low initial_lr=1e-3 (which assumes a converged
+    starting point and would badly undertrain a random init)."""
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDS_750epochs(
+        nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDS):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 750
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFocalWeighted(nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRC):
+    """
+    Same as SplitRC, but adds per-class weighting to the focal/CE term — SplitRC's blob
+    loss gives RC its own recall-aggressive alpha/beta, but the per-voxel focal/CE term
+    still weights every voxel equally regardless of class, and RC is 0.0047% of all
+    training voxels (44.8x rarer than SNFH, 8.2x rarer than ET, 21328x rarer than
+    background — measured over all 1037 fold_1 training cases' full-resolution segs).
+    Across 358 logged epochs of the un-weighted SplitRC run, RC's per-voxel pseudo-dice
+    never moved off exactly 0.0 (softmax prob ~1e-10 at true RC voxels even on large,
+    >10k-voxel cavities) — the model defaults to background/SNFH at every RC voxel and the
+    unweighted focal/CE mean never pushes back hard enough to change that, regardless of
+    how much RC-centered sampling exposure it gets (case+instance-level sampling was
+    verified separately and is not the bottleneck).
+
+    Weight vector started from median-frequency balancing (Eigen & Fergus), computed over
+    voxel frequency across the 4 foreground classes only; background is left at 1.0
+    (unchanged) since focal's (1-p_t)^gamma term already suppresses its easy, correctly-
+    classified voxels — reweighting it further risked destabilizing the already-solid
+    background/foreground boundary for no clear benefit.
+
+    First attempt used the literal median-frequency value for SNFH (0.117, 44.6x below
+    RC's 5.221 — exactly cancelling their voxel-count ratio, since SNFH was identified via
+    logit/intensity analysis as RC's actual closest competitor, not background). A 750-
+    epoch run with that vector fixed RC (non-zero and climbing from epoch ~5 on) but broke
+    SNFH instead: SNFH's pseudo-dice went to exactly 0.0 for 40+ straight epochs (same
+    zero-true-positive signature RC had before) and showed no sign of recovering the way it
+    did in an earlier, shorter smoke test — background was now out-competing SNFH the same
+    way it previously out-competed RC. Run was stopped at epoch ~55.
+
+    Current vector softens SNFH's weight to 0.35 (from 0.117) — still meaningfully down-
+    weighted vs background, but not enough to lose the argmax competition outright:
+        background=1.0, NETC=2.317, SNFH=0.35, ET=0.638, RC=5.221
+    RC/SNFH ratio drops from 44.6x to 14.9x. Not derived from voxel counts anymore (that
+    formula is what caused the SNFH collapse) — chosen empirically as a middle ground
+    between the unweighted baseline (1.0, RC dead) and the literal median-frequency value
+    (0.117, SNFH dead). May still need further tuning.
+
+    This remains a starting point, not a fully validated fix — RC's near-total logit
+    collapse may also require the network to actually learn to use FLAIR/T1 as RC-positive
+    evidence (channel-ablation showed the model currently leans on T2, RC's WEAKEST
+    discriminator from SNFH, while FLAIR/T1 — RC's STRONGEST discriminators from SNFH — are
+    used against RC).
+    """
+    _focal_class_weights = (1.0, 2.317, 0.35, 0.638, 5.221)
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDSFocalWeighted(
+    nnUNetTrainerBraTSBlobLossSaturatingFewDS,
+    nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFocalWeighted,
+):
+    """Combines reduced DS scales with SplitRC + the per-class focal/CE weighting above,
+    WITHOUT the WarmStart mixin — matches
+    nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDS_750epochs (the run that
+    crashed at epoch 358 with RC pseudo-dice still at 0.0) except for the added focal
+    weight, so the two runs are directly comparable."""
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDSFocalWeighted_750epochs(
+        nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDSFocalWeighted):
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 750
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFocalWeightedWarmStart(
+    nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDSFocalWeighted
+):
+    """
+    Warm-starts (via -pretrained_weights) from the crashed
+    nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFewDS_750epochs run's checkpoint —
+    same architecture/config, only the loss changes (adds the per-class focal weight) — to
+    smoke-test whether RC's pseudo-dice can move off 0.0 at all.
+
+    Deliberately uses a HIGH initial_lr (asserted below), the OPPOSITE of this codebase's
+    usual WarmStart mixin (nnUNetTrainerBraTSBlobLossSaturatingWarmStart), which drops to
+    1e-3 to protect already-good transferred features when warm-starting across a
+    DIFFERENT architecture/resolution. That concern doesn't apply here: RC's features are
+    dead (softmax prob ~1e-10 after 350 epochs), so the entire point of this run is to find
+    out whether the new focal weight can move them AT ALL. A low LR would risk a false
+    negative -- RC staying at 0.0 simply because the gradient was too small to matter within
+    a short smoke-test, not because the loss reweighting doesn't work.
+    """
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.initial_lr = 1e-2
+        assert self.initial_lr >= 1e-2, (
+            f'this smoke test requires a high LR to find out whether the focal weight can '
+            f'move RC at all -- got initial_lr={self.initial_lr}, expected >= 1e-2'
+        )
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr,
+                                    weight_decay=self.weight_decay, momentum=0.99, nesterov=True)
+        lr_scheduler = WarmupPolyLRScheduler(optimizer, self.initial_lr, self.num_epochs, warmup_steps=10)
+        return optimizer, lr_scheduler
+
+
+class nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFocalWeightedWarmStart_30epochs(
+        nnUNetTrainerBraTSBlobLossSaturatingBalancedSplitRCFocalWeightedWarmStart):
+    """Short smoke-test length: enough epochs (~1h at this config's ~120s/epoch) to see
+    whether RC's pseudo-dice moves off 0.0, without committing to a full-length run."""
+    def __init__(self, plans, configuration, fold, dataset_json, device=torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 30

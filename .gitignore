@@ -1,6 +1,8 @@
 results/
 
-
+postprocessing_out/
+submissions/
+logs/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
